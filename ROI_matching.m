@@ -1,230 +1,327 @@
-% Written by Theoklitos Amvrosiadis, 08/2022
+function final_matches = ROI_matching(sesname1, sesname2, varargin)
+%ROI_MATCHING Matches ROIs across two imaging sessions of the same FOV.
+%
+%   This function identifies corresponding Regions of Interest (ROIs) between
+%   two different imaging sessions. The algorithm uses a hybrid approach:
+%   1.  An initial affine transformation is calculated based on a small seed of
+%       manually matched ROIs to correct for global shifts/rotations.
+%   2.  A cost matrix is computed based on both the transformed spatial
+%       distance between ROI centroids and a feature-based distance. This
+%       feature distance compares the geometric relationship (distances and
+%       angles) of each ROI to all other ROIs within its own session.
+%   3.  Potential matches are identified by minimizing this cost matrix.
+%   4.  The results are displayed in an interactive GUI for final review and
+%       manual correction by the user.
+%
+%   SYNTAX:
+%   final_matches = ROI_matching(sesname1, sesname2)
+%   final_matches = ROI_matching(sesname1, sesname2, 'Name', Value, ...)
+%
+%   INPUTS:
+%   sesname1        (string): Name of the first session's directory.
+%   sesname2        (string): Name of the second session's directory.
+%
+%   OPTIONAL NAME-VALUE PAIRS:
+%   'working_dir'   (string): Path to the parent directory containing the
+%                             session folders. Default: current directory (pwd).
+%   'alpha'         (double): Weighting factor between 0 and 1. Balances the
+%                             cost between spatial distance (weighted by alpha)
+%                             and feature-based distance (weighted by 1-alpha).
+%                             Default: 0.5.
+%   'error_tol'     (double): Maximum combined error threshold to accept a match.
+%                             Default: 1e3.
+%   'feature_tol'   (double): A secondary, stricter threshold on the feature
+%                             distance, used for specific cases. Default: 50.
+%
+%   OUTPUT:
+%   final_matches   (cell array): An N-by-3 cell array where N is the number
+%                   of ROIs in the first session.
+%                   Column 1: ROI index from session 1.
+%                   Column 2: Matched ROI index from session 2 (NaN if no match).
+%                   Column 3: Confidence string ('High', 'Medium', 'Low').
+%
+%   DEPENDENCIES:
+%   - Requires several helper functions to be on the MATLAB path:
+%     - ReadImageJROI.m       (to load ImageJ ROI sets)
+%     - get_user_matches.m    (for manual seeding of matches)
+%     - calculateROIcentroids.m (to compute ROI centers)
+%     - compute_angles.m      (to compute inter-ROI angles)
+%     - plotImageWithRois.m   (for visualization)
+%
+%   Written by Theoklitos Amvrosiadis, 08/2022
 
-% Matches ROIs across two imaging sessions with the same FOV
-% Requires an initial seed of 3 pairs of matched neurons
+%% 1. Input Parsing and Data Loading
 
+% --- Handle optional inputs with InputParser for robustness ---
+p = inputParser;
+addRequired(p, 'sesname1', @ischar);
+addRequired(p, 'sesname2', @ischar);
+addParameter(p, 'working_dir', pwd, @ischar);
+addParameter(p, 'alpha', 0.5, @(x) isnumeric(x) && x >= 0 && x <= 1);
+addParameter(p, 'error_tol', 1e3, @isnumeric);
+addParameter(p, 'feature_tol', 50, @isnumeric);
+parse(p, sesname1, sesname2, varargin{:});
 
-function final_matches = ROI_matching(sesname1, sesname2, working_dir)
+% --- Assign parsed inputs to variables ---
+working_dir   = p.Results.working_dir;
+ALPHA         = p.Results.alpha;
+ERROR_TOL     = p.Results.error_tol;
+FEATURE_TOL   = p.Results.feature_tol;
+CONFIDENCE_THRESH = [20, 50]; % [High/Medium, Medium/Low]
 
-if nargin < 3
-    working_dir = 'C:\Users\theox\Desktop\Experiments\Working';
-end
-
-% Choose FOV1 ROIset
-DIR1 = dir(fullfile(working_dir, [sesname1, '\ROIs\*um\*P03.zip']));
-if size(DIR1, 1) > 1
-    DIR1 = DIR1(1);
-end
-Fov1_path = fullfile(DIR1.folder, DIR1.name);
-image_path1 = [Fov1_path(1:end-3), 'tif'];
-I1 = imread(image_path1);
-all_my_rois1 = ReadImageJROI(Fov1_path);
-
-
-% Choose FOV2 ROIset
-DIR2 = dir(fullfile(working_dir, [sesname2, '\ROIs\*um\*P03.zip']));
-if size(DIR2, 1) > 1
-    DIR2 = DIR2(1);
-end
-if strcmp(sesname2, '20220719_Thy1214')
-    DIR2 = dir(['C:\Users\theox\Desktop\Experiments\Working\', sesname2, '\ROIs\*um\*P10.zip']);
-end
-
-Fov2_path = fullfile(DIR2.folder, DIR2.name);
-image_path2 = [Fov2_path(1:end-3), 'tif'];
-I2 = imread(image_path2);
-all_my_rois2 = ReadImageJROI(Fov2_path);
-
+% --- Load data for both sessions using a helper function ---
+[I1, all_my_rois1, centroids1] = load_session_data(sesname1, working_dir);
+[I2, all_my_rois2, centroids2] = load_session_data(sesname2, working_dir);
 numrois1 = size(all_my_rois1, 2);
 
-% Match ROIs
-% Provide a seed of matches to start the process
+
+%% 2. Get Seed Matches for Transformation
+
+% --- User provides a few initial matches to seed the algorithm ---
+% This is critical for calculating the initial geometric transformation.
 matched_rois = get_user_matches(I1, all_my_rois1, I2, all_my_rois2, sesname1, sesname2);
+
+% --- Handle case where user provides no seeds ---
 if isempty(matched_rois)
-    potential_matches(:, 1) = (1:numrois1)';
-    potential_matches(:, 2) = nan;
-
+    potential_matches = [(1:numrois1)', nan(numrois1, 1)];
     final_matches = num2cell(potential_matches);
-    
-    return
+    warning('No seed matches provided. Returning unmatched list.');
+    return;
 end
+M = size(matched_rois, 1); % Number of seed matches
 
-centroids1 = calculateROIcentroids(all_my_rois1);
-centroids2 = calculateROIcentroids(all_my_rois2);
 
-% Calculate all distances between ROIs
+%% 3. Calculate Affine Transform and Spatial Distances
+
+% --- Use seed matches to find the affine transform between FOVs ---
+tform = estimateGeometricTransform(centroids1(matched_rois(:, 1), :), centroids2(matched_rois(:, 2), :), 'affine');
+
+% --- Apply transform and calculate pairwise spatial distances ---
+transformed_centroids1 = transformPointsForward(tform, centroids1);
+all_centroid_distances = pdist2(transformed_centroids1, centroids2);
+
+
+%% 4. Calculate Feature-Based Error Metric
+
+% --- For each ROI, create a "feature vector" of its distances to all others ---
 all_distances_Fov1 = squareform(pdist(centroids1));
 all_distances_Fov2 = squareform(pdist(centroids2));
 
-all_distances1 = all_distances_Fov1(matched_rois(:, 1), :);
-all_distances2 = all_distances_Fov2(matched_rois(:, 2), :);
+% --- Use only the seed matches to compare feature vectors ---
+% This creates a [M x numrois1] and [M x numrois2] matrix.
+seed_distances1 = all_distances_Fov1(matched_rois(:, 1), :);
+seed_distances2 = all_distances_Fov2(matched_rois(:, 2), :);
 
-tform = estimateGeometricTransform(centroids1(matched_rois(:, 1), :), centroids2(matched_rois(:, 2), :), 'affine');
-transformed_centroids1 = transformPointsForward(tform, centroids1);
+% --- Calculate the mean squared error between feature vectors ---
+% The result mse_distances(i, j) is the MSE between the feature vector of
+% ROI i (from ses1) and ROI j (from ses2).
+mse_distances = pdist2(seed_distances1', seed_distances2', 'squaredeuclidean') / M;
 
-transformed_centroids2 = centroids2;
+% --- (Optional) A similar calculation can be done with angles ---
+% Note: The original code weighted angles, but the logic was identical to
+% distances. The 'alpha' parameter in the original code was set to 1,
+% effectively ignoring angles. This refactoring simplifies it to just
+% distances but can be extended. To re-introduce angles, calculate
+% mse_angles and combine as:
+% feature_errors = alpha * mse_distances + (1 - alpha) * mse_angles;
+feature_errors = mse_distances;
 
-all_centroid_distances = pdist2(transformed_centroids1, transformed_centroids2);
 
-% Calculate angles between ROIs
-angles1 = compute_angles(centroids1);
-angles2 = compute_angles(centroids2);
+%% 5. Compute Final Cost Matrix and Find Initial Matches
 
-angles_diff1 = angles1(matched_rois(:, 1), :);
-angles_diff2 = angles2(matched_rois(:, 2), :);
+% --- Combine spatial and feature distances into a final cost matrix ---
+% A weighted sum based on the ALPHA parameter.
+final_cost = ALPHA * all_centroid_distances + (1 - ALPHA) * feature_errors;
 
-alpha = 1; % Adjust this value between 0 and 1 to balance the weight of distance and angle information
-
-M = size(matched_rois, 1); % Number of seed matches
-
-% Calculate squared Euclidean distances between the 'feature vectors' (columns)
-% The result sq_dist(i, j) = sum((all_distances1(:,i) - all_distances2(:,j)).^2)
-sq_dist_distances = pdist2(all_distances1', all_distances2', 'squaredeuclidean'); % size: numrois1 x numrois2
-sq_dist_angles = pdist2(angles_diff1', angles_diff2', 'squaredeuclidean');       % size: numrois1 x numrois2
-
-% Calculate the mean squared error by dividing by the number of seed matches (M)
-mse_distances = sq_dist_distances / M;
-mse_angles = sq_dist_angles / M;
-
-distance_errors = alpha * mse_distances + (1 - alpha) * mse_angles;
-
-final_distances = all_centroid_distances + distance_errors;
-
-for imatch = 1:size(matched_rois, 1)
-    final_distances(matched_rois(imatch, 1), matched_rois(imatch, 2)) = 0;
+% --- Force seed matches to have zero cost to ensure they are kept ---
+for iMatch = 1:M
+    final_cost(matched_rois(iMatch, 1), matched_rois(iMatch, 2)) = 0;
 end
 
-% assignment = munkres(final_distances);
-
-potential_matches = nan(numrois1, 2); % Pre-allocate with NaNs
-% Assign matches based on minimum errors
+% --- Find the best match for each ROI by minimizing the cost ---
+potential_matches = nan(numrois1, 2);
 potential_matches(:, 1) = (1:numrois1)';
-% [~, potential_matches(:, 2)] = min(distance_errors, [], 2);
-[~, potential_matches(:, 2)] = min(final_distances, [], 2);
-% potential_matches(:, 2) = potential_matches(:, 2);
-% potential_matches(matched_rois(:, 1), 2) = matched_rois(:, 2);
+[min_costs, potential_matches(:, 2)] = min(final_cost, [], 2);
 
 
-% Apply quality check and remove spurious matches
-% Set a tolerance for the error above which matches should be considered
-% erroneous
-error_tolerance = 1e3;
+%% 6. Quality Control and Conflict Resolution
 
-for iRoi = 1:size(potential_matches, 1)
-    if final_distances(potential_matches(iRoi, 1), potential_matches(iRoi, 2)) > error_tolerance ||...
-            ((contains(sesname1, 'Thy1214') || contains(sesname1, 'Thy1217') || contains(sesname1, 'Bl424')) && distance_errors(potential_matches(iRoi, 1), potential_matches(iRoi, 2)) >= 50)
-        potential_matches(iRoi, 2) = nan;
+% --- Remove poor matches based on error thresholds ---
+is_high_error = min_costs > ERROR_TOL;
+
+% A secondary check for specific preparations if needed.
+% This could be adapted or removed based on experimental needs.
+is_high_feature_error = false(numrois1, 1);
+if contains(sesname1, {'Thy1214', 'Thy1217', 'Bl424'})
+    for iRoi = 1:numrois1
+       is_high_feature_error(iRoi) = feature_errors(potential_matches(iRoi,1), potential_matches(iRoi,2)) >= FEATURE_TOL;
     end
 end
 
-locked_pairs = matched_rois; 
+potential_matches(is_high_error | is_high_feature_error, 2) = nan;
 
-% Check for ROIs that have been matched more than once and keep only the
-% best match
-for iRoi = 1:size(potential_matches, 1)
-    if ~isnan(potential_matches(iRoi, 2)) && sum(potential_matches(:, 2) == potential_matches(iRoi, 2)) > 1
-        conflicting_idy = find(potential_matches(:, 2) == potential_matches(iRoi, 2));
-        
-        if ~logical(sum(ismember(conflicting_idy, locked_pairs(:, 1))))
-            dist_err_conf = nan(1, numel(conflicting_idy));
-            for iconflict = 1:numel(conflicting_idy)
-                dist_err_conf(iconflict) = final_distances(conflicting_idy(iconflict), potential_matches(conflicting_idy(iconflict), 2));
-            end
-            roi_losers = conflicting_idy(dist_err_conf ~= min(dist_err_conf));
-            potential_matches(roi_losers, 2) = nan;
+% --- Resolve conflicts: one ROI in ses2 matched to multiple in ses1 ---
+% For each ROI in session 2, find if it has multiple matches.
+unique_targets = unique(potential_matches(~isnan(potential_matches(:, 2)), 2));
+for target_roi = unique_targets'
+    conflicting_indices = find(potential_matches(:, 2) == target_roi);
+    
+    if numel(conflicting_indices) > 1
+        % If one of the conflicting ROIs is a user-defined seed, keep it.
+        seed_match_idx = find(ismember(conflicting_indices, matched_rois(:, 1)), 1);
+        if ~isempty(seed_match_idx)
+            best_match_idx = conflicting_indices(seed_match_idx);
         else
-            roi_losers = conflicting_idy(conflicting_idy ~= conflicting_idy(ismember(conflicting_idy, locked_pairs(:, 1))));
-            potential_matches(roi_losers, 2) = nan;
-        end        
+            % Otherwise, keep the one with the lowest total cost.
+            [~, min_idx] = min(min_costs(conflicting_indices));
+            best_match_idx = conflicting_indices(min_idx);
+        end
+        
+        % Set all other conflicting matches to NaN.
+        conflicting_indices(conflicting_indices == best_match_idx) = [];
+        potential_matches(conflicting_indices, 2) = nan;
     end
 end
 
-% Attach a confidence value
+
+%% 7. Assign Confidence and Prepare for GUI
+
 final_matches = num2cell(potential_matches);
 for iRoi = 1:size(final_matches, 1)
-    if ~isnan(final_matches{iRoi, 2}) && distance_errors(final_matches{iRoi, 1}, final_matches{iRoi, 2}) < 20
-        final_matches{iRoi, 3} = 'High';
-    elseif ~isnan(final_matches{iRoi, 2}) && distance_errors(final_matches{iRoi, 1}, final_matches{iRoi, 2}) < 50
-        final_matches{iRoi, 3} = 'Medium';
-    elseif ~isnan(final_matches{iRoi, 2})
-        final_matches{iRoi, 3} = 'Low';
-        % final_matches{iRoi, 2} = nan;
-        % final_matches{iRoi, 3} = nan;
-    end
-end
-
-% Create a figure
-figure
-ax1 = subplot('Position', [0.001, 0.25, 0.32, 0.64]);
-plotImageWithRois(I1, all_my_rois1, sesname1);
-ax2 = subplot('Position', [0.321, 0.25, 0.32, 0.64]);
-plotImageWithRois(I2, all_my_rois2, sesname2);
-linkaxes
-
-% Create a table
-table_handle = uitable('Data', final_matches, 'ColumnName', {sesname1, sesname2, 'Certainty'}, 'RowName', [], 'Units', 'normalized', 'Position', [0.8 0.1 0.2 0.8]);
-table_handle.FontSize = 12;
-table_handle.ColumnEditable = [false, true, false];  % Only column 2 is editable
-
-% Set table CellSelectionCallback
-
-table_handle.CellEditCallback = @(src, event)roi_table_edit_callback(src, event, I1, all_my_rois1, I2, all_my_rois2, sesname1, sesname2);
-table_handle.CellSelectionCallback = @(src, event)roi_table_selection_callback(src, event, I1, all_my_rois1, I2, all_my_rois2, sesname1, sesname2);
-
-% Set the figure title
-sgtitle('ROI Matching Results');
-
-uiwait(gcf);  % Wait for user to close the figure before returning the results
-
-
-function roi_table_edit_callback(src, event, I1, all_my_rois1, I2, all_my_rois2, sesname1, sesname2)
-    
-    selectedRowIndex = event.Indices(1);
-    selectedColumnIndex = event.Indices(2);
-
-    % Only allow editing of column 2
-    if selectedColumnIndex == 2
-        newValue = event.NewData;
-
-        if ~isnan(newValue) && newValue >= 1 && newValue <= numel(all_my_rois2)
-            % Find if newValue already exists in column 2
-            conflictIdx = find(cell2mat(final_matches(:, 2)) == newValue);
-
-            % Set the conflicting cell to NaN
-            if ~isempty(conflictIdx)
-                final_matches{conflictIdx, 2} = NaN;
-                final_matches{conflictIdx, 3} = [];
-            end
-
-            % Update the edited cell
-            final_matches{selectedRowIndex, 2} = newValue;
-            src.Data = final_matches;
+    if ~isnan(final_matches{iRoi, 2})
+        roi_idx1 = final_matches{iRoi, 1};
+        roi_idx2 = final_matches{iRoi, 2};
+        current_feature_error = feature_errors(roi_idx1, roi_idx2);
+        
+        if current_feature_error < CONFIDENCE_THRESH(1)
+            final_matches{iRoi, 3} = 'High';
+        elseif current_feature_error < CONFIDENCE_THRESH(2)
+            final_matches{iRoi, 3} = 'Medium';
         else
-            final_matches{selectedRowIndex, 2} = NaN;
-            final_matches{selectedRowIndex, 3} = [];
-            src.Data = final_matches;
+            final_matches{iRoi, 3} = 'Low';
         end
     end
-    
-    src.Data = final_matches;
-
 end
 
-function roi_table_selection_callback(src, event, I1, all_my_rois1, I2, all_my_rois2, sesname1, sesname2)
-    
-    if isempty(event.Indices)
-        return;
+
+%% 8. Create Interactive GUI for Manual Inspection and Correction
+
+f = figure('Name', 'ROI Matching Results', 'NumberTitle', 'off', 'WindowState', 'maximized');
+
+% --- Display FOVs side-by-side ---
+ax1 = subplot('Position', [0.05, 0.1, 0.4, 0.8]);
+plotImageWithRois(I1, all_my_rois1, sesname1);
+title(sesname1, 'Interpreter', 'none');
+
+ax2 = subplot('Position', [0.47, 0.1, 0.4, 0.8]);
+plotImageWithRois(I2, all_my_rois2, sesname2);
+title(sesname2, 'Interpreter', 'none');
+
+linkaxes([ax1, ax2]);
+
+% --- Display results in an editable table ---
+table_handle = uitable('Parent', f, ...
+    'Data', final_matches, ...
+    'ColumnName', {sesname1, sesname2, 'Certainty'}, ...
+    'RowName', [], ...
+    'Units', 'normalized', ...
+    'Position', [0.88 0.1 0.11 0.8], ...
+    'FontSize', 12, ...
+    'ColumnEditable', [false, true, false]);
+
+% --- Set callbacks for table interaction ---
+table_handle.CellSelectionCallback = @(src, event)roi_table_selection_callback(src, event);
+table_handle.CellEditCallback = @(src, event)roi_table_edit_callback(src, event);
+
+% --- Wait for user to close the figure before returning the results ---
+uiwait(f);
+
+% --- Retrieve the latest data from the table upon closing ---
+final_matches = table_handle.Data;
+
+
+%% --- Nested Helper and Callback Functions ---
+
+    function [img, rois, centroids] = load_session_data(sesname, base_dir)
+        % Finds and loads the TIF image and ROI.zip file for a session.
+        session_path = fullfile(base_dir, sesname);
+        
+        % Find the ROI zip file (handles variations in naming)
+        roi_dir = dir(fullfile(session_path, 'ROIs', '*um', '*P*.zip'));
+        if isempty(roi_dir)
+            error('No ROI zip file found for session: %s', sesname);
+        end
+        roi_zip_path = fullfile(roi_dir(1).folder, roi_dir(1).name);
+        
+        % Corresponding TIF is assumed to have the same base name
+        tif_path = [roi_zip_path(1:end-3), 'tif'];
+        if ~exist(tif_path, 'file')
+             error('No TIF file found corresponding to: %s', roi_zip_path);
+        end
+        
+        img = imread(tif_path);
+        rois = ReadImageJROI(roi_zip_path);
+        centroids = calculateROIcentroids(rois);
     end
-    selectedRowIndex = event.Indices(1);
 
-    selectedROI1 = final_matches{selectedRowIndex, 1};
-    selectedROI2 = final_matches{selectedRowIndex, 2};
+    function roi_table_selection_callback(src, event)
+        % Highlights the selected ROI pair on the FOV plots.
+        if isempty(event.Indices) || event.Indices(1) > size(src.Data, 1)
+            return;
+        end
+        
+        selectedRow = event.Indices(1);
+        selectedData = src.Data(selectedRow, :);
+        
+        roi1_idx = selectedData{1};
+        roi2_idx = selectedData{2};
+        
+        % Update plots
+        subplot(ax1);
+        plotImageWithRois(I1, all_my_rois1, '', roi1_idx);
+        title(sesname1, 'Interpreter', 'none');
+        
+        subplot(ax2);
+        plotImageWithRois(I2, all_my_rois2, '', roi2_idx);
+        title(sesname2, 'Interpreter', 'none');
+    end
 
-    subplot(ax1);
-    plotImageWithRois(I1, all_my_rois1, sesname1, selectedROI1)
-    subplot(ax2);
-    plotImageWithRois(I2, all_my_rois2, sesname2, selectedROI2)
-    linkaxes
-end
-
+    function roi_table_edit_callback(src, event)
+        % Handles manual edits of matches in the table.
+        if isempty(event.Indices)
+            return;
+        end
+        
+        row = event.Indices(1);
+        col = event.Indices(2);
+        
+        % Only column 2 (sesname2 matches) is editable
+        if col == 2
+            current_data = src.Data;
+            new_val = event.NewData;
+            
+            % Validate input
+            if isnan(new_val)
+                 current_data{row, 2} = NaN;
+                 current_data{row, 3} = [];
+            elseif isnumeric(new_val) && new_val >= 1 && new_val <= numel(all_my_rois2)
+                % Check if this ROI is already matched elsewhere
+                conflict_idx = find([current_data{:, 2}] == new_val);
+                conflict_idx(conflict_idx == row) = []; % Ignore self
+                
+                if ~isempty(conflict_idx)
+                    % If conflict exists, set the old match to NaN
+                    current_data{conflict_idx, 2} = NaN;
+                    current_data{conflict_idx, 3} = [];
+                end
+                
+                current_data{row, 2} = new_val;
+                current_data{row, 3} = 'Manual'; % Mark as manually edited
+            else
+                % Revert to previous value if input is invalid
+                current_data{row, 2} = event.PreviousData;
+            end
+            src.Data = current_data; % Update table data
+        end
+    end
 end
