@@ -38,7 +38,7 @@ The main function `ROI_matching.m` relies on several helper functions which must
 
 1.  Clone the repository:
     ```bash
-    git clone [https://github.com/your-username/ROI-Matching.git](https://github.com/your-username/ROI-Matching.git)
+    git clone [https://github.com/your-username/ROI-Matching.git](https://github.com/rochefort-lab/ROI_matching.git)
     ```
 2.  Open MATLAB.
 3.  Add the repository and its `helpers` subfolder to your MATLAB path:
