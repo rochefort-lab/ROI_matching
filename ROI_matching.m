@@ -54,12 +54,13 @@ function final_matches = ROI_matching(sesname1, sesname2, varargin)
 
 % --- Handle optional inputs with InputParser for robustness ---
 p = inputParser;
-addRequired(p, 'sesname1', @ischar);
-addRequired(p, 'sesname2', @ischar);
+addRequired(p, 'sesname1', @ischar||isstring(s));
+addRequired(p, 'sesname2', @ischar||isstring(s));
 addParameter(p, 'working_dir', pwd, @ischar);
 addParameter(p, 'alpha', 0.5, @(x) isnumeric(x) && x >= 0 && x <= 1);
 addParameter(p, 'error_tol', 1e3, @isnumeric);
 addParameter(p, 'feature_tol', 50, @isnumeric);
+addParameter(p,'confidence_thresh',[20 50],@(x)isnumeric(x)&&numel(x)==2);
 parse(p, sesname1, sesname2, varargin{:});
 
 % --- Assign parsed inputs to variables ---
@@ -67,7 +68,7 @@ working_dir   = p.Results.working_dir;
 ALPHA         = p.Results.alpha;
 ERROR_TOL     = p.Results.error_tol;
 FEATURE_TOL   = p.Results.feature_tol;
-CONFIDENCE_THRESH = [20, 50]; % [High/Medium, Medium/Low]
+CONFIDENCE_THRESH = p.Results.confidence_thresh; % [High/Medium, Medium/Low]
 
 % --- Load data for both sessions using a helper function ---
 [I1, all_my_rois1, centroids1] = load_session_data(sesname1, working_dir);
@@ -82,7 +83,7 @@ numrois1 = size(all_my_rois1, 2);
 matched_rois = get_user_matches(I1, all_my_rois1, I2, all_my_rois2, sesname1, sesname2);
 
 % --- Handle case where user provides no seeds ---
-if isempty(matched_rois)
+if isempty(matched_rois) || size(matched_rois,1) < 3
     potential_matches = [(1:numrois1)', nan(numrois1, 1)];
     final_matches = num2cell(potential_matches);
     warning('No seed matches provided. Returning unmatched list.');
@@ -152,11 +153,6 @@ is_high_error = min_costs > ERROR_TOL;
 % A secondary check for specific preparations if needed.
 % This could be adapted or removed based on experimental needs.
 is_high_feature_error = false(numrois1, 1);
-if contains(sesname1, {'Thy1214', 'Thy1217', 'Bl424'})
-    for iRoi = 1:numrois1
-       is_high_feature_error(iRoi) = feature_errors(potential_matches(iRoi,1), potential_matches(iRoi,2)) >= FEATURE_TOL;
-    end
-end
 
 potential_matches(is_high_error | is_high_feature_error, 2) = nan;
 
@@ -325,3 +321,4 @@ final_matches = table_handle.Data;
         end
     end
 end
+
