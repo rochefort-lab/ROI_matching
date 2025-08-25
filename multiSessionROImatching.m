@@ -42,7 +42,6 @@ function commonNeuronIDs = multiSessionROImatching(sesList, varargin)
 %   - ROI_matching.m: The function for pairwise ROI matching.
 %
 %   Written by Theoklitos Amvrosiadis
-%   Refactored by Gemini, 08/2025
 
 %% 1. Setup and Input Parsing
 
