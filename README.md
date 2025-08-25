@@ -122,6 +122,7 @@ The repository is organized as follows:
 ```
 ROI-Matching/
 ├── ROI_matching.m             # Main function
+├── multiSessionROImatching.m  # Function for matching across multiple sessions
 ├── helpers/                   # Directory for all dependency functions
 └── README.md                  # This documentation
 ```
