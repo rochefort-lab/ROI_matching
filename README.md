@@ -68,6 +68,53 @@ The function will launch an interactive window. After you review and close the w
 
 ---
 
+## Multi-Session Matching (`multiSessionROImatching.m`)
+
+This function extends the pairwise matching to find neurons that are consistently tracked across multiple sessions. It uses the `ROI_matching.m` function as its core engine and implements a caching system to avoid re-computing existing matches, making it highly efficient for longitudinal analysis.
+
+### Workflow and Caching
+
+1.  **Reference Session**: The first session in the input list is designated as the "reference". All other sessions are matched against this reference.
+2.  **Cache Check**: The function looks for a `.mat` cache file (e.g., `ref_session_name_roi_matching_cache.mat`). If a valid cache exists, it loads the stored pairwise mappings.
+3.  **Process New Sessions**: It compares the list of requested sessions against the list of processed sessions from the cache. Only new, unprocessed sessions are run through the `ROI_matching.m` function.
+4.  **Update Cache**: The results of any new pairings are added to the mapping data structure, and the cache file is overwritten with the updated information.
+5.  **Calculate Intersection**: The function then uses the complete set of required mappings (from cache or newly computed) to find the set of reference ROIs that have a valid match in *every single one* of the requested sessions.
+6.  **Format Output**: The final output is a cell array providing the list of common ROI indices for the reference session, and the corresponding indices for each of the other sessions.
+
+### Usage Example
+
+```matlab
+% Define a list of sessions for analysis
+all_sessions = {'20220815_Mouse1_Ses1', ...  % This will be the reference
+                '20220816_Mouse1_Ses2', ...
+                '20220817_Mouse1_Ses3', ...
+                '20220818_Mouse1_Ses4'};
+
+% Define the working directory
+work_dir = '/path/to/your/experiment/folder';
+
+% --- First run ---
+% This will compute matches for Ses2, Ses3, and Ses4 against Ses1
+% and create a new cache file.
+common_neurons = multiSessionROImatching(all_sessions, 'working_dir', work_dir);
+
+% --- Subsequent run with a subset of sessions ---
+% This run will be much faster as it will load all mappings from the cache.
+% It will only compute the new intersection for the requested subset.
+subset_sessions = {'20220815_Mouse1_Ses1', ...
+                   '20220817_Mouse1_Ses3'};
+common_subset = multiSessionROImatching(subset_sessions, 'working_dir', work_dir);
+
+% --- Subsequent run with a new session added ---
+% This will load the existing cache and only compute the new mapping for Ses5.
+sessions_with_new = {'20220815_Mouse1_Ses1', ...
+                     '20220816_Mouse1_Ses2', ...
+                     '20220819_Mouse1_Ses5'}; % New session
+common_new = multiSessionROImatching(sessions_with_new, 'working_dir', work_dir);
+```
+
+
+
 ## File Structure
 
 The repository is organized as follows:
@@ -78,4 +125,5 @@ ROI-Matching/
 ├── helpers/                   # Directory for all dependency functions
 └── README.md                  # This documentation
 ```
+
 It is recommended to create a separate directory for your experimental data.
